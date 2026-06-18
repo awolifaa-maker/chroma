@@ -3,13 +3,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chroma_error::ChromaError;
 use chroma_types::{AttachedFunction, Chunk, LogRecord};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::execution::operators::execute_task::{AttachedFunctionExecutor, HydratedInputBatch};
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const POLL_INITIAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const POLL_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 const DEFAULT_DATABASE_NAME: &str = "FOUNDATION";
 
 #[derive(Debug, Serialize)]
@@ -20,6 +23,17 @@ struct CurrentsRequest {
     wiki_collection: String,
     currents_collection: String,
     wiki_write_offset: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CurrentsResponse {
+    call_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusResponse {
+    status: String,
+    error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -44,6 +58,10 @@ pub enum HttpCurrentsError {
     InvalidInputBatchCount(usize),
     #[error("HTTP error: {0}")]
     Http(String),
+    #[error("Currents refresh failed: {0}")]
+    CurrentsFailed(String),
+    #[error("Poll timeout after {0:?}")]
+    PollTimeout(std::time::Duration),
 }
 
 impl ChromaError for HttpCurrentsError {
@@ -55,7 +73,9 @@ impl ChromaError for HttpCurrentsError {
             | HttpCurrentsError::InvalidInputBatchCount(_) => {
                 chroma_error::ErrorCodes::InvalidArgument
             }
-            HttpCurrentsError::Http(_) => chroma_error::ErrorCodes::Internal,
+            HttpCurrentsError::Http(_)
+            | HttpCurrentsError::CurrentsFailed(_)
+            | HttpCurrentsError::PollTimeout(_) => chroma_error::ErrorCodes::Internal,
         }
     }
 }
@@ -120,7 +140,7 @@ impl HttpCurrentsExecutor {
     async fn refresh_currents(
         &self,
         request_body: &CurrentsRequest,
-    ) -> Result<(), Box<dyn ChromaError>> {
+    ) -> Result<String, Box<dyn ChromaError>> {
         let currents_url = format!("{}/currents", self.endpoint_url.trim_end_matches('/'));
 
         let response = self
@@ -152,7 +172,101 @@ impl HttpCurrentsExecutor {
             ))));
         }
 
-        Ok(())
+        let body = response.text().await.map_err(|e| {
+            Box::new(HttpCurrentsError::Http(format!(
+                "failed to read currents response: {e}"
+            ))) as Box<dyn ChromaError>
+        })?;
+        let currents_resp: CurrentsResponse = serde_json::from_str(&body).map_err(|e| {
+            Box::new(HttpCurrentsError::Http(format!(
+                "failed to parse currents response: {e}"
+            ))) as Box<dyn ChromaError>
+        })?;
+
+        Ok(currents_resp.call_id)
+    }
+
+    /// GET /status/{call_id} in a loop with exponential backoff until
+    /// the job completes or fails.
+    async fn poll_until_done(&self, call_id: &str) -> Result<(), Box<dyn ChromaError>> {
+        let status_url = format!(
+            "{}/status/{}",
+            self.endpoint_url.trim_end_matches('/'),
+            call_id
+        );
+        let start = std::time::Instant::now();
+        let mut interval = POLL_INITIAL_INTERVAL;
+
+        loop {
+            if start.elapsed() > POLL_TIMEOUT {
+                return Err(Box::new(HttpCurrentsError::PollTimeout(POLL_TIMEOUT)));
+            }
+
+            tokio::time::sleep(interval).await;
+            interval = std::cmp::min(interval * 2, POLL_MAX_INTERVAL);
+
+            let response = self
+                .client
+                .get(&status_url)
+                .header("Modal-Key", &self.modal_key)
+                .header("Modal-Secret", &self.modal_secret)
+                .timeout(REQUEST_TIMEOUT)
+                .send()
+                .await;
+
+            let response = match response {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("[HttpCurrentsExecutor] Poll request failed (will retry): {e}");
+                    continue;
+                }
+            };
+
+            if !response.status().is_success() {
+                tracing::warn!(
+                    "[HttpCurrentsExecutor] Poll returned HTTP {} (will retry)",
+                    response.status()
+                );
+                continue;
+            }
+
+            let status_resp: StatusResponse = match response.json().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        "[HttpCurrentsExecutor] Failed to parse poll response (will retry): {e}"
+                    );
+                    continue;
+                }
+            };
+
+            match status_resp.status.as_str() {
+                "pending" => {
+                    tracing::debug!(
+                        "[HttpCurrentsExecutor] Job {} still pending ({:.0}s elapsed)",
+                        call_id,
+                        start.elapsed().as_secs_f64(),
+                    );
+                }
+                "complete" => {
+                    tracing::info!(
+                        "[HttpCurrentsExecutor] Job {} completed after {:.0}s",
+                        call_id,
+                        start.elapsed().as_secs_f64(),
+                    );
+                    return Ok(());
+                }
+                "failed" => {
+                    let msg = status_resp.error.unwrap_or_else(|| "unknown error".into());
+                    return Err(Box::new(HttpCurrentsError::CurrentsFailed(msg)));
+                }
+                other => {
+                    tracing::warn!(
+                        "[HttpCurrentsExecutor] Unexpected status {other:?}, treating as pending"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -184,7 +298,11 @@ impl AttachedFunctionExecutor for HttpCurrentsExecutor {
             self.endpoint_url,
         );
 
-        self.refresh_currents(&request_body).await?;
+        let call_id = self.refresh_currents(&request_body).await?;
+        tracing::info!(
+            "[HttpCurrentsExecutor] Job spawned with call_id={call_id}, polling for completion"
+        );
+        self.poll_until_done(&call_id).await?;
 
         Ok(Chunk::new(Arc::from(Vec::<LogRecord>::new())))
     }
@@ -192,7 +310,10 @@ impl AttachedFunctionExecutor for HttpCurrentsExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{CurrentsRequest, HttpCurrentsError, HttpCurrentsExecutor, DEFAULT_DATABASE_NAME};
+    use super::{
+        CurrentsRequest, CurrentsResponse, HttpCurrentsError, HttpCurrentsExecutor,
+        DEFAULT_DATABASE_NAME,
+    };
 
     #[test]
     fn currents_request_uses_foundation_default_database_name() {
@@ -218,5 +339,15 @@ mod tests {
         assert!(matches!(err, HttpCurrentsError::InvalidInputBatchCount(2)));
 
         HttpCurrentsExecutor::validate_input_batch_count(1).unwrap();
+    }
+
+    #[test]
+    fn currents_response_requires_call_id() {
+        let response: CurrentsResponse = serde_json::from_str(r#"{"call_id":"currents-123"}"#)
+            .expect("call_id response should parse");
+        assert_eq!(response.call_id, "currents-123");
+
+        let err = serde_json::from_str::<CurrentsResponse>(r#"{}"#).unwrap_err();
+        assert!(err.to_string().contains("missing field `call_id`"));
     }
 }
